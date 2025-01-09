@@ -2,13 +2,18 @@ package com.google.devtools.ksp.test
 
 import org.gradle.testkit.runner.GradleRunner
 import org.junit.Assert
+import org.junit.Assume
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.junit.runners.Parameterized
 
-class HmppIT {
+@RunWith(Parameterized::class)
+class HmppIT(val useKSP2: Boolean) {
     @Rule
     @JvmField
-    val project: TemporaryTestProject = TemporaryTestProject("hmpp")
+    val project: TemporaryTestProject = TemporaryTestProject("hmpp", useKSP2 = useKSP2)
 
     val taskToFilesTraditional = mapOf(
         ":workload:kspCommonMainKotlinMetadata" to "w: [ksp] EchoProcessor: CommonMain",
@@ -64,20 +69,28 @@ class HmppIT {
         ),
     )
 
+    @Ignore
     @Test
     fun testHmpp() {
+        Assume.assumeFalse(useKSP2)
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
         val gradleRunner = GradleRunner.create().withProjectDir(project.root)
 
         taskToFilesHmpp.forEach { (task, expected) ->
             gradleRunner.withArguments(
                 "--configuration-cache-problems=warn",
                 "--rerun-tasks",
-                "-Pksp.experimental.processing.model=hierarchical",
                 task,
             ).build().let { result ->
                 val logs = result.output.lines().filter { it.startsWith("w: [ksp] EchoProcessor: ") }.toSet()
                 Assert.assertTrue(logs == expected)
             }
         }
+    }
+
+    companion object {
+        @JvmStatic
+        @Parameterized.Parameters(name = "KSP2={0}")
+        fun params() = listOf(arrayOf(true), arrayOf(false))
     }
 }

@@ -17,19 +17,23 @@
 
 package com.google.devtools.ksp
 
+import com.google.devtools.ksp.common.AnyChanges
+import com.google.devtools.ksp.common.copyWithTimestamp
+import com.google.devtools.ksp.common.findLocationString
+import com.google.devtools.ksp.common.impl.CodeGeneratorImpl
+import com.google.devtools.ksp.common.impl.JsPlatformInfoImpl
+import com.google.devtools.ksp.common.impl.JvmPlatformInfoImpl
+import com.google.devtools.ksp.common.impl.KSPCompilationError
+import com.google.devtools.ksp.common.impl.NativePlatformInfoImpl
+import com.google.devtools.ksp.common.impl.UnknownPlatformInfoImpl
 import com.google.devtools.ksp.processing.KSPLogger
 import com.google.devtools.ksp.processing.PlatformInfo
 import com.google.devtools.ksp.processing.SymbolProcessor
 import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
 import com.google.devtools.ksp.processing.SymbolProcessorProvider
-import com.google.devtools.ksp.processing.impl.CodeGeneratorImpl
-import com.google.devtools.ksp.processing.impl.JsPlatformInfoImpl
-import com.google.devtools.ksp.processing.impl.JvmPlatformInfoImpl
-import com.google.devtools.ksp.processing.impl.KSPCompilationError
+import com.google.devtools.ksp.processing.impl.KSObjectCacheManager
 import com.google.devtools.ksp.processing.impl.MessageCollectorBasedKSPLogger
-import com.google.devtools.ksp.processing.impl.NativePlatformInfoImpl
 import com.google.devtools.ksp.processing.impl.ResolverImpl
-import com.google.devtools.ksp.processing.impl.UnknownPlatformInfoImpl
 import com.google.devtools.ksp.symbol.KSAnnotated
 import com.google.devtools.ksp.symbol.KSClassDeclaration
 import com.google.devtools.ksp.symbol.KSDeclarationContainer
@@ -41,13 +45,19 @@ import com.google.devtools.ksp.symbol.Origin
 import com.google.devtools.ksp.symbol.Visibility
 import com.google.devtools.ksp.symbol.impl.java.KSFileJavaImpl
 import com.google.devtools.ksp.symbol.impl.kotlin.KSFileImpl
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.StandardFileSystems
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.psi.PsiJavaFile
 import com.intellij.psi.PsiManager
+import com.intellij.psi.impl.file.impl.JavaFileManager
 import org.jetbrains.kotlin.analyzer.AnalysisResult
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
+import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCliJavaFileManagerImpl
+import org.jetbrains.kotlin.config.JvmAnalysisFlags
+import org.jetbrains.kotlin.config.LanguageVersionSettings
 import org.jetbrains.kotlin.container.ComponentProvider
 import org.jetbrains.kotlin.context.ProjectContext
 import org.jetbrains.kotlin.descriptors.ModuleDescriptor
@@ -71,7 +81,7 @@ class KotlinSymbolProcessingExtension(
     logger: KSPLogger,
     val testProcessor: SymbolProcessorProvider? = null,
 ) : AbstractKotlinSymbolProcessingExtension(options, logger, testProcessor != null) {
-    override fun loadProviders(): List<SymbolProcessorProvider> {
+    override fun loadProviders(rootDisposable: Disposable): List<SymbolProcessorProvider> {
         if (!initialized) {
             providers = if (testProcessor != null) {
                 listOf(testProcessor)
@@ -80,8 +90,13 @@ class KotlinSymbolProcessingExtension(
                 val classLoader =
                     URLClassLoader(processingClasspath.map { it.toURI().toURL() }.toTypedArray(), javaClass.classLoader)
 
+                Disposer.register(rootDisposable) {
+                    classLoader.close()
+                }
+
                 ServiceLoaderLite.loadImplementations(SymbolProcessorProvider::class.java, classLoader).filter {
-                    options.processors.isEmpty() || it.javaClass.name in options.processors
+                    (options.processors.isEmpty() && it.javaClass.name !in options.excludedProcessors) ||
+                        it.javaClass.name in options.processors
                 }
             }
             if (providers.isEmpty()) {
@@ -138,6 +153,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
             if (!options.returnOkOnError && logger.hasError()) {
                 return AnalysisResult.compilationError(BindingContext.EMPTY)
             }
+            // DO NOT updateFromShadow(); withCompilation requires the java output shadows to continue.
             return null
         }
 
@@ -149,11 +165,24 @@ abstract class AbstractKotlinSymbolProcessingExtension(
         val psiManager = PsiManager.getInstance(project)
         if (initialized) {
             psiManager.dropPsiCaches()
+            psiManager.dropResolveCaches()
+            invalidateKotlinCliJavaFileManagerCache(project)
+        } else {
+            // In case of broken builds.
+            if (javaShadowBase.exists()) {
+                javaShadowBase.deleteRecursively()
+            }
         }
 
+        val javaShadowRoots = mutableListOf<File>()
+        if (javaShadowBase.exists() && javaShadowBase.isDirectory) {
+            javaShadowBase.listFiles()?.forEach {
+                javaShadowRoots.add(it)
+            }
+        }
         val localFileSystem = VirtualFileManager.getInstance().getFileSystem(StandardFileSystems.FILE_PROTOCOL)
-        val javaSourceRoots =
-            if (initialized) options.javaSourceRoots + options.javaOutputDir else options.javaSourceRoots
+        // FIXME: reuse from previous rounds.
+        val javaSourceRoots = options.javaSourceRoots + javaShadowRoots
         val javaFiles = javaSourceRoots
             .sortedBy { Files.isSymbolicLink(it.toPath()) } // Get non-symbolic paths first
             .flatMap { root -> root.walk().filter { it.isFile && it.extension == "java" }.toList() }
@@ -243,11 +272,11 @@ abstract class AbstractKotlinSymbolProcessingExtension(
             }
         }
 
-        val providers = loadProviders()
+        val providers = loadProviders(project)
         if (!initialized) {
             codeGenerator = CodeGeneratorImpl(
                 options.classOutputDir,
-                options.javaOutputDir,
+                { javaShadowDir },
                 options.kotlinOutputDir,
                 options.resourceOutputDir,
                 options.projectBaseDir,
@@ -266,7 +295,8 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                             logger,
                             options.apiVersion,
                             options.compilerVersion,
-                            findTargetInfos(module)
+                            findTargetInfos(options.languageVersionSettings, module),
+                            KotlinVersion(1, 0),
                         )
                     )
                 }?.let { analysisResult ->
@@ -290,6 +320,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                         processor.process(resolver).filter { it.origin == Origin.KOTLIN || it.origin == Origin.JAVA }
                 }?.let {
                     resolver.tearDown()
+                    incrementalContext.closeFiles()
                     return it
                 }
                 if (logger.hasError()) {
@@ -303,6 +334,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
         // Post processing.
         newFileNames = codeGenerator.generatedFile.filter { it.extension == "kt" || it.extension == "java" }
             .map { it.canonicalPath.replace(File.separatorChar, '/') }.toSet()
+
         if (codeGenerator.generatedFile.isEmpty()) {
             finished = true
         }
@@ -315,9 +347,11 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                     processor.onError()
                 }?.let {
                     resolver.tearDown()
+                    incrementalContext.closeFiles()
                     return it
                 }
             }
+            incrementalContext.closeFiles()
         } else {
             if (finished) {
                 processors.forEach { processor ->
@@ -325,6 +359,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                         processor.finish()
                     }?.let {
                         resolver.tearDown()
+                        incrementalContext.closeFiles()
                         return it
                     }
                 }
@@ -343,6 +378,8 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                         codeGenerator.outputs,
                         codeGenerator.sourceToOutputs
                     )
+                } else {
+                    incrementalContext.closeFiles()
                 }
             }
         }
@@ -350,24 +387,24 @@ abstract class AbstractKotlinSymbolProcessingExtension(
             logger.reportAll()
         }
         resolver.tearDown()
-        return if (finished && !options.withCompilation) {
-            if (!options.returnOkOnError && logger.hasError()) {
+        if (finished && !options.withCompilation) {
+            updateFromShadow()
+            return if (!options.returnOkOnError && logger.hasError()) {
                 AnalysisResult.compilationError(BindingContext.EMPTY)
             } else {
                 AnalysisResult.success(BindingContext.EMPTY, module, shouldGenerateCode = false)
             }
-        } else {
-            AnalysisResult.RetryWithAdditionalRoots(
-                BindingContext.EMPTY,
-                module,
-                listOf(options.javaOutputDir),
-                listOf(options.kotlinOutputDir),
-                listOf(options.classOutputDir)
-            )
         }
+        return AnalysisResult.RetryWithAdditionalRoots(
+            BindingContext.EMPTY,
+            module,
+            listOf(javaShadowDir),
+            listOf(options.kotlinOutputDir),
+            listOf(options.classOutputDir)
+        )
     }
 
-    abstract fun loadProviders(): List<SymbolProcessorProvider>
+    abstract fun loadProviders(rootDisposable: Disposable): List<SymbolProcessorProvider>
 
     private var annotationProcessingComplete = false
 
@@ -413,6 +450,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                 e is KSPCompilationError -> {
                     logger.error("${project.findLocationString(e.file, e.offset)}: ${e.message}")
                     logger.reportAll()
+                    updateFromShadow()
                     return if (options.returnOkOnError) {
                         AnalysisResult.success(BindingContext.EMPTY, module, shouldGenerateCode = false)
                     } else {
@@ -423,6 +461,7 @@ abstract class AbstractKotlinSymbolProcessingExtension(
                 e.isNotRecoverable() -> {
                     e.logToError()
                     logger.reportAll()
+                    updateFromShadow()
                     return if (options.returnOkOnError) {
                         AnalysisResult.success(BindingContext.EMPTY, module, shouldGenerateCode = false)
                     } else {
@@ -438,15 +477,55 @@ abstract class AbstractKotlinSymbolProcessingExtension(
         }
         return null
     }
+
+    private val javaShadowBase = File(options.javaOutputDir, "byRounds")
+
+    private val javaShadowDir: File
+        get() = File(javaShadowBase, "$rounds")
+
+    private fun updateFromShadow() {
+        if (javaShadowBase.exists() && javaShadowBase.isDirectory()) {
+            javaShadowBase.listFiles()?.forEach { roundDir ->
+                if (roundDir.exists() && roundDir.isDirectory()) {
+                    roundDir.walkTopDown().forEach {
+                        val dst = File(options.javaOutputDir, File(it.path).toRelativeString(roundDir))
+                        if (dst.isFile || !dst.exists()) {
+                            copyWithTimestamp(it, dst, false)
+                        }
+                    }
+                }
+            }
+            javaShadowBase.deleteRecursively()
+        }
+    }
 }
 
-fun findTargetInfos(module: ModuleDescriptor): List<PlatformInfo> =
+fun findTargetInfos(languageVersionSettings: LanguageVersionSettings, module: ModuleDescriptor): List<PlatformInfo> =
     module.platform?.componentPlatforms?.map { platform ->
         when (platform) {
-            is JdkPlatform -> JvmPlatformInfoImpl(platform.platformName, platform.targetVersion.toString())
-            is JsPlatform -> JsPlatformInfoImpl(platform.platformName)
-            is NativePlatform -> NativePlatformInfoImpl(platform.platformName, platform.targetName)
+            is JdkPlatform -> JvmPlatformInfoImpl(
+                platformName = platform.platformName,
+                jvmTarget = platform.targetVersion.toString(),
+                jvmDefaultMode = languageVersionSettings.getFlag(JvmAnalysisFlags.jvmDefaultMode).description
+            )
+            is JsPlatform -> JsPlatformInfoImpl(
+                platformName = platform.platformName
+            )
+            is NativePlatform -> NativePlatformInfoImpl(
+                platformName = platform.platformName,
+                targetName = platform.targetName
+            )
             // Unknown platform; toString() may be more informative than platformName
             else -> UnknownPlatformInfoImpl(platform.toString())
         }
     } ?: emptyList()
+
+// FIXME: remove as soon as possible.
+private fun invalidateKotlinCliJavaFileManagerCache(project: Project): Boolean {
+    val javaFileManager = (JavaFileManager.getInstance(project) as? KotlinCliJavaFileManagerImpl) ?: return false
+    val privateCacheField = KotlinCliJavaFileManagerImpl::class.java.getDeclaredField("topLevelClassesCache")
+    if (!privateCacheField.trySetAccessible())
+        return false
+    (privateCacheField.get(javaFileManager) as? MutableMap<*, *>)?.clear() ?: return false
+    return true
+}

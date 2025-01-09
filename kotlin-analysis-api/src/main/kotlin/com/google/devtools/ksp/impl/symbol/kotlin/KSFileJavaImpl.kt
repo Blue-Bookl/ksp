@@ -17,8 +17,8 @@
 
 package com.google.devtools.ksp.impl.symbol.kotlin
 
-import com.google.devtools.ksp.KSObjectCache
-import com.google.devtools.ksp.processing.impl.KSNameImpl
+import com.google.devtools.ksp.common.KSObjectCache
+import com.google.devtools.ksp.common.impl.KSNameImpl
 import com.google.devtools.ksp.symbol.KSAnnotation
 import com.google.devtools.ksp.symbol.KSDeclaration
 import com.google.devtools.ksp.symbol.KSFile
@@ -29,7 +29,7 @@ import com.google.devtools.ksp.symbol.Location
 import com.google.devtools.ksp.symbol.Origin
 import com.intellij.psi.PsiJavaFile
 
-class KSFileJavaImpl private constructor(private val psi: PsiJavaFile) : KSFile {
+class KSFileJavaImpl private constructor(val psi: PsiJavaFile) : KSFile, Deferrable {
     companion object : KSObjectCache<PsiJavaFile, KSFileJavaImpl>() {
         fun getCached(psi: PsiJavaFile) = cache.getOrPut(psi) { KSFileJavaImpl(psi) }
     }
@@ -43,7 +43,7 @@ class KSFileJavaImpl private constructor(private val psi: PsiJavaFile) : KSFile 
     override val declarations: Sequence<KSDeclaration> by lazy {
         psi.classes.asSequence().mapNotNull { psi ->
             analyze {
-                psi.getNamedClassSymbol()?.let { KSClassDeclarationImpl.getCached(it) }
+                psi.namedClassSymbol?.let { KSClassDeclarationImpl.getCached(it) }
             }
         }
     }
@@ -62,5 +62,13 @@ class KSFileJavaImpl private constructor(private val psi: PsiJavaFile) : KSFile 
 
     override fun toString(): String {
         return "File: ${this.fileName}"
+    }
+
+    // Although Resolver.getSymbolsWithAnnotation never returns a java file because the latter cannot have file
+    // annotations, this is used internally to restore files across rounds.
+    override fun defer(): Restorable {
+        return Restorable {
+            analyze { getCached(psi) }
+        }
     }
 }

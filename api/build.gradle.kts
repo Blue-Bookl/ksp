@@ -15,12 +15,9 @@ plugins {
     kotlin("jvm")
     `maven-publish`
     signing
-    id("org.jetbrains.dokka") version ("1.7.20")
+    id("org.jetbrains.dokka")
 }
 
-dependencies {
-    api(kotlin("stdlib", kotlinBaseVersion))
-}
 tasks {
     val sourcesJar by creating(Jar::class) {
         archiveClassifier.set("sources")

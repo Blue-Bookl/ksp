@@ -5,15 +5,19 @@ import org.gradle.testkit.runner.GradleRunner
 import org.gradle.testkit.runner.TaskOutcome
 import org.junit.Assert
 import org.junit.Assume
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.junit.runners.Parameterized
 import java.io.File
 import java.util.jar.*
 
-class KMPImplementedIT {
+@RunWith(Parameterized::class)
+class KMPImplementedIT(val useKSP2: Boolean) {
     @Rule
     @JvmField
-    val project: TemporaryTestProject = TemporaryTestProject("kmp")
+    val project: TemporaryTestProject = TemporaryTestProject("kmp", useKSP2 = useKSP2)
 
     private fun verify(jarName: String, contents: List<String>) {
         val artifact = File(project.root, jarName)
@@ -92,13 +96,7 @@ class KMPImplementedIT {
         ).build().let {
             Assert.assertEquals(TaskOutcome.SUCCESS, it.task(":workload-js:build")?.outcome)
             verify(
-                "workload-js/build/libs/workload-js-jslegacy-1.0-SNAPSHOT.jar",
-                listOf(
-                    "playground-workload-js-js-legacy.js"
-                )
-            )
-            verify(
-                "workload-js/build/libs/workload-js-jsir-1.0-SNAPSHOT.klib",
+                "workload-js/build/libs/workload-js-js-1.0-SNAPSHOT.klib",
                 listOf(
                     "default/ir/types.knt"
                 )
@@ -108,6 +106,89 @@ class KMPImplementedIT {
             Assert.assertTrue(it.output.contains("w: [ksp] List has superTypes: true"))
             checkExecutionOptimizations(it.output)
         }
+    }
+
+    @Test
+    fun triggerException() {
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val gradleRunner = GradleRunner.create().withProjectDir(project.root)
+        val path = "workload/src/commonMain/kotlin/com/example/FooBar.kt"
+        val file = File(project.root, path)
+
+        fun setup(shouldFail: Boolean) {
+            project.restore(path)
+
+            // Add an annotation that'll will make the processor trigger an exception.
+            if (shouldFail) {
+                file.writeText(
+                    file.readText()
+                        .replace("//@TriggerExceptionAnnotation", "@TriggerExceptionAnnotation")
+                )
+            }
+        }
+
+        // Start the kotlin daemon?
+        setup(shouldFail = false)
+        gradleRunner.withArguments("compileKotlinJvm").build()
+
+        // Make the processor fail
+        setup(shouldFail = true)
+        gradleRunner.withArguments("compileKotlinJvm").buildAndFail()
+
+        // Should not trigger the caching issue
+        setup(shouldFail = false)
+        gradleRunner.withArguments("compileKotlinJvm").build()
+    }
+
+    @Test
+    fun testWasm() {
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val gradleRunner = GradleRunner.create().withProjectDir(project.root)
+
+        gradleRunner.withArguments(
+            "--configuration-cache-problems=warn",
+            "clean",
+            ":workload-wasm:build"
+        ).build().let {
+            Assert.assertEquals(TaskOutcome.SUCCESS, it.task(":workload-wasm:build")?.outcome)
+            verify(
+                "workload-wasm/build/libs/workload-wasm-wasm-js-1.0-SNAPSHOT.klib",
+                listOf(
+                    "default/ir/types.knt"
+                )
+            )
+            Assert.assertFalse(it.output.contains("kotlin scripting plugin:"))
+            Assert.assertTrue(it.output.contains("w: [ksp] platforms: [wasm-js"))
+            Assert.assertTrue(it.output.contains("w: [ksp] List has superTypes: true"))
+            checkExecutionOptimizations(it.output)
+        }
+    }
+
+    @Test
+    fun testDefaultArgumentsImpl() {
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        // FIXME: KSP1
+        Assume.assumeTrue(useKSP2)
+        val gradleRunner = GradleRunner.create().withProjectDir(project.root)
+
+        val newSrc = File(project.root, "workload-wasm/src/wasmJsMain/kotlin/com/example/AnnoOnProperty.kt")
+        newSrc.appendText(
+            """
+@Target(AnnotationTarget.PROPERTY)
+annotation class OnProperty
+
+class AnnoOnProperty {
+    @OnProperty
+    val value: Int = 0
+}
+            """.trimIndent()
+        )
+
+        gradleRunner.withArguments(
+            "--configuration-cache-problems=warn",
+            "clean",
+            ":workload-wasm:build"
+        ).build()
     }
 
     @Test
@@ -152,16 +233,16 @@ class KMPImplementedIT {
         ).build().let {
             Assert.assertEquals(TaskOutcome.SUCCESS, it.task(":workload-androidNative:build")?.outcome)
             verifyKexe(
-                "workload-androidNative/build/bin/androidNativeX64/debugExecutable/workload-androidNative.kexe"
+                "workload-androidNative/build/bin/androidNativeX64/debugShared/libworkload_androidNative.so"
             )
             verifyKexe(
-                "workload-androidNative/build/bin/androidNativeX64/releaseExecutable/workload-androidNative.kexe"
+                "workload-androidNative/build/bin/androidNativeX64/releaseShared/libworkload_androidNative.so"
             )
             verifyKexe(
-                "workload-androidNative/build/bin/androidNativeArm64/debugExecutable/workload-androidNative.kexe"
+                "workload-androidNative/build/bin/androidNativeArm64/debugShared/libworkload_androidNative.so"
             )
             verifyKexe(
-                "workload-androidNative/build/bin/androidNativeArm64/releaseExecutable/workload-androidNative.kexe"
+                "workload-androidNative/build/bin/androidNativeArm64/releaseShared/libworkload_androidNative.so"
             )
             Assert.assertFalse(it.output.contains("kotlin scripting plugin:"))
             Assert.assertTrue(it.output.contains("w: [ksp] platforms: [Native"))
@@ -221,6 +302,30 @@ class KMPImplementedIT {
         }
     }
 
+    @Ignore
+    @Test
+    fun testNonEmbeddableArtifact() {
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val gradleRunner = GradleRunner.create().withProjectDir(project.root)
+
+        gradleRunner.withArguments(
+            "--configuration-cache-problems=warn",
+            "-Pkotlin.native.useEmbeddableCompilerJar=false",
+            ":workload-linuxX64:kspTestKotlinLinuxX64"
+        ).build()
+
+        gradleRunner.withArguments(
+            "--configuration-cache-problems=warn",
+            "-Pkotlin.native.useEmbeddableCompilerJar=true",
+            ":workload-linuxX64:kspTestKotlinLinuxX64"
+        ).build()
+
+        gradleRunner.withArguments(
+            "--configuration-cache-problems=warn",
+            ":workload-linuxX64:kspTestKotlinLinuxX64"
+        ).build()
+    }
+
     @Test
     fun testLinuxX64ErrorLog() {
         Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
@@ -251,14 +356,7 @@ class KMPImplementedIT {
         )
 
         verify(
-            "workload/build/libs/workload-jslegacy-1.0-SNAPSHOT.jar",
-            listOf(
-                "playground-workload-js-legacy.js"
-            )
-        )
-
-        verify(
-            "workload/build/libs/workload-jsir-1.0-SNAPSHOT.klib",
+            "workload/build/libs/workload-js-1.0-SNAPSHOT.klib",
             listOf(
                 "default/ir/types.knt"
             )
@@ -266,10 +364,10 @@ class KMPImplementedIT {
 
         verifyKexe("workload/build/bin/linuxX64/debugExecutable/workload.kexe")
         verifyKexe("workload/build/bin/linuxX64/releaseExecutable/workload.kexe")
-        verifyKexe("workload/build/bin/androidNativeX64/debugExecutable/workload.kexe")
-        verifyKexe("workload/build/bin/androidNativeX64/releaseExecutable/workload.kexe")
-        verifyKexe("workload/build/bin/androidNativeArm64/debugExecutable/workload.kexe")
-        verifyKexe("workload/build/bin/androidNativeArm64/releaseExecutable/workload.kexe")
+        verifyKexe("workload/build/bin/androidNativeX64/debugShared/libworkload.so")
+        verifyKexe("workload/build/bin/androidNativeX64/releaseShared/libworkload.so")
+        verifyKexe("workload/build/bin/androidNativeArm64/debugShared/libworkload.so")
+        verifyKexe("workload/build/bin/androidNativeArm64/releaseShared/libworkload.so")
 
         // TODO: Enable after CI's Xcode version catches up.
         // Assert.assertTrue(
@@ -317,7 +415,7 @@ class KMPImplementedIT {
         gradleRunner.withArguments(
             "--configuration-cache-problems=warn",
             "clean",
-            "build",
+            ":workload:build",
             "-Pksp.allow.all.target.configuration=false"
         ).buildAndFail().apply {
             Assert.assertTrue(
@@ -332,7 +430,7 @@ class KMPImplementedIT {
         gradleRunner.withArguments(
             "--configuration-cache-problems=warn",
             "clean",
-            "build"
+            ":workload:build",
         ).build().apply {
             Assert.assertTrue(
                 messages.all {
@@ -342,5 +440,11 @@ class KMPImplementedIT {
             verifyAll(this)
             checkExecutionOptimizations(output)
         }
+    }
+
+    companion object {
+        @JvmStatic
+        @Parameterized.Parameters(name = "KSP2={0}")
+        fun params() = listOf(arrayOf(true), arrayOf(false))
     }
 }

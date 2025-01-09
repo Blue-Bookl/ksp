@@ -1,11 +1,10 @@
-
 plugins {
-    kotlin("jvm") version "1.8.0"
+    kotlin("jvm") version embeddedKotlinVersion
 }
 
 kotlin {
     jvmToolchain {
-        languageVersion.set(JavaLanguageVersion.of(11))
+        languageVersion.set(JavaLanguageVersion.of(17))
     }
 }
 
